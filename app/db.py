@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -43,6 +42,9 @@ async def init_schema() -> None:
         await conn.execute(q.CREATE_JOB_TABLE)
         await conn.execute(q.CREATE_JOB_UNIQUE)
         await conn.execute(q.CREATE_AUDIT_TABLE)
+        await conn.execute(q.CREATE_OVERRIDE_TABLE)
+        await conn.execute(q.CREATE_OVERRIDE_REQUEST_UNIQUE)
+        await conn.execute(q.CREATE_OVERRIDE_ONE_OPEN_PER_TABLE)
         await conn.execute(q.SWEEP_INTERRUPTED)
 
 

@@ -5,6 +5,11 @@ services:
       POSTGRES_DB: devicedb
       POSTGRES_USER: appuser
       POSTGRES_PASSWORD: apppass
+    # 演示围绕“按插入量触发 autovacuum”的门槛，实例级 autovacuum 必须开启
+    command:
+      - "postgres"
+      - "-c"
+      - "autovacuum=on"
     ports:
       - "55432:5432"
     volumes:
@@ -26,9 +31,20 @@ services:
       DATABASE_URL: postgresql://appuser:apppass@db:5432/devicedb
       VACUUM_STATEMENT_TIMEOUT_MS: "0"
       SYNC_WAIT_SECONDS: "30"
+      OVERRIDE_RECONCILE_INTERVAL_SECONDS: "1"
+      OVERRIDE_RESTORE_LOCK_TIMEOUT_SECONDS: "3"
     ports:
       - "8000:8000"
     restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   pgdata:

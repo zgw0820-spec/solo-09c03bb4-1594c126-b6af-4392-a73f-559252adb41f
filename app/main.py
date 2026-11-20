@@ -5,20 +5,45 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from psycopg import sql
 
-from . import db, maintenance
+from . import db, maintenance, overrides
 from .config import settings
 from .schemas import (
+    AutovacuumOverrideRequest,
+    AutovacuumOverrideResponse,
     DiagnosticsResponse,
     HealthResponse,
     JobResponse,
-    TableRef,
+    OverrideActionResponse,
+    OverrideListResponse,
+    TableOverrideSettingResponse,
     TerminateRequest,
     TerminateResponse,
     VacuumRequest,
 )
+
+OVERRIDE_SWEEP_INTERVAL_MAX = 60.0
+
+
+async def _override_reconciler() -> None:
+    """后台到期恢复轮询。
+
+    不依赖进程内定时器状态: 每次只看库中 ``expires_at <= now()`` 的记录，
+    因此服务停机跨过期限后，启动即会恢复；恢复被锁挡住时按间隔自动重试。
+    """
+    while True:
+        try:
+            await overrides.sweep_due_overrides()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            overrides.log.exception("autovacuum override 到期恢复轮询失败")
+        await asyncio.sleep(
+            max(0.2, min(settings.override_reconcile_interval_seconds,
+                        OVERRIDE_SWEEP_INTERVAL_MAX))
+        )
 
 
 @asynccontextmanager
@@ -26,8 +51,21 @@ async def lifespan(app: FastAPI):
     await db.open_pool()
     # 建表 + 把上次进程遗留的 running 作业标记为 interrupted
     await db.init_schema()
-    yield
-    await db.close_pool()
+    # 先立即扫一遍（覆盖“停机跨过期限”的场景），再进入周期轮询
+    try:
+        await overrides.sweep_due_overrides()
+    except Exception:
+        overrides.log.exception("启动时处理到期的 autovacuum override 失败")
+    sweep_task = asyncio.create_task(_override_reconciler())
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await db.close_pool()
 
 
 app = FastAPI(
@@ -40,6 +78,8 @@ app = FastAPI(
         "- 同表并发维护单飞（部分唯一索引 + advisory lock）。\n"
         "- 请求超时或服务重启后，未确认的清理不会被报为完成，"
         "可经作业接口核实或重试。\n"
+        "- 可临时提高表级 autovacuum 插入阈值，到期自动恢复原设定/继承；"
+        "参数被人工改动时保留现状，被表锁挡住时标记待恢复并自动重试。\n"
         "- 所有 n_dead_tup/尺寸字段均为估值或当前占用，"
         "不代表“已释放磁盘字节”。"
     ),
@@ -229,5 +269,196 @@ async def root() -> dict:
             "/maintenance/vacuum",
             "/maintenance/jobs/{job_id}",
             "/maintenance/jobs",
+            "/autovacuum/overrides",
+            "/autovacuum/overrides/{id}",
+            "/autovacuum/overrides/{id}/restore",
+            "/autovacuum/table-setting",
+            "/autovacuum/overrides/reconcile",
         ],
     }
+
+
+# --- 表级 autovacuum 插入阈值临时覆盖 ----------------------------------------
+
+@app.post(
+    "/autovacuum/overrides",
+    response_model=OverrideActionResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        200: {
+            "model": OverrideActionResponse,
+            "description": "同一申请号原样重送：返回原记录与原截止时间，"
+            "不会重新计时",
+        }
+    },
+    tags=["autovacuum-override"],
+    summary="申请临时提高某表按插入量触发 autovacuum 的门槛",
+    description=(
+        "写入表级 `autovacuum_vacuum_insert_scale_factor` 并登记截止时间。\n\n"
+        "- 同一 `request_no` 原样重送 -> 200，返回原记录与原截止时间"
+        "（`replayed=true`），不会新开窗口；参数或时长不一致则 409。\n"
+        "- 该表已有生效中/待恢复申请 -> 409，旧窗口恢复结束后才受理。\n"
+        "- 到期由后台自动恢复申请前的表级设定；原来继承实例默认值的恢复继承。"
+    ),
+)
+async def create_autovacuum_override(
+    req: AutovacuumOverrideRequest, response: Response
+):
+    await _check_relation(req.schema_name, req.table_name)
+    try:
+        row = await overrides.apply_override(
+            req.schema_name,
+            req.table_name,
+            req.request_no,
+            req.autovacuum_vacuum_insert_scale_factor,
+            req.duration_seconds,
+        )
+    except overrides.OverrideError as exc:
+        raise _override_http_error(exc) from exc
+    if row["replayed"]:
+        response.status_code = status.HTTP_200_OK
+        row["next_action"] = (
+            "同一申请号原样重送，已沿用原记录与原截止时间，未重新计时；"
+            + row["next_action"]
+        )
+        return OverrideActionResponse(
+            message="同一申请号已存在且参数一致，沿用原截止时间",
+            override=AutovacuumOverrideResponse(**row),
+        )
+    return OverrideActionResponse(
+        message=(
+            f"已受理，表级 {overrides.SCALE_FACTOR_OPTION}="
+            f"{row['applied_raw_value']}，截止 {row['expires_at']}"
+        ),
+        override=AutovacuumOverrideResponse(**row),
+    )
+
+
+@app.get(
+    "/autovacuum/overrides",
+    response_model=OverrideListResponse,
+    tags=["autovacuum-override"],
+    summary="列出阈值申请记录（可按表/状态过滤）",
+)
+async def list_autovacuum_overrides(
+    schema_name: str | None = Query(None, description="按 schema 过滤"),
+    table_name: str | None = Query(None, description="按表名过滤"),
+    status_filter: str | None = Query(
+        None,
+        alias="status",
+        pattern="^(active|pending_restore|restored|preserved)$",
+        description="按状态过滤",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+) -> OverrideListResponse:
+    rows = await overrides.list_overrides(
+        schema_name, table_name, status_filter, limit
+    )
+    return OverrideListResponse(
+        overrides=[AutovacuumOverrideResponse(**r) for r in rows]
+    )
+
+
+@app.post(
+    "/autovacuum/overrides/reconcile",
+    tags=["autovacuum-override"],
+    summary="立即处理所有已到期申请（后台轮询之外的手动触发）",
+    description=(
+        "处理逻辑与后台轮询完全相同；被 VACUUM 等表锁挡住的记录会标记"
+        " `pending_restore` 并继续自动重试，不会谎报已恢复。"
+    ),
+)
+async def reconcile_overrides() -> dict:
+    handled = await overrides.sweep_due_overrides()
+    return {
+        "handled": handled,
+        "message": "已处理到期申请；pending_restore 表示恢复被阻塞，将自动重试",
+    }
+
+
+@app.get(
+    "/autovacuum/table-setting",
+    response_model=TableOverrideSettingResponse,
+    tags=["autovacuum-override"],
+    summary="查询库中该表的实际设定与未结束申请（含截止时间）",
+    description=(
+        "`insert_scale_factor.source` 直接来自 `pg_class.reloptions`："
+        "`table` 表示存在表级设定，`inherited` 表示继承实例默认值。"
+        "人工改动会立即反映在此处。"
+    ),
+)
+async def get_table_autovacuum_setting(
+    schema_name: str = "public",
+    table_name: str = "device_events",
+) -> TableOverrideSettingResponse:
+    await _check_relation(schema_name, table_name)
+    try:
+        out = await overrides.describe_table_setting(schema_name, table_name)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return TableOverrideSettingResponse(**out)
+
+
+@app.get(
+    "/autovacuum/overrides/{override_id}",
+    response_model=AutovacuumOverrideResponse,
+    tags=["autovacuum-override"],
+    summary="查询单个申请（含状态、截止时间、恢复结果）",
+)
+async def get_autovacuum_override(override_id: int) -> AutovacuumOverrideResponse:
+    try:
+        row = await overrides.get_override(override_id)
+    except overrides.OverrideError as exc:
+        raise _override_http_error(exc) from exc
+    return AutovacuumOverrideResponse(**row)
+
+
+@app.post(
+    "/autovacuum/overrides/{override_id}/restore",
+    response_model=OverrideActionResponse,
+    tags=["autovacuum-override"],
+    summary="立即尝试恢复（不等截止时间），供演练/排障",
+    description=(
+        "仅对 `active`/`pending_restore` 记录有效。会把记录提前置为到期并"
+        "走同一恢复流程：参数已被人工改动则 `preserved`；被表锁挡住则"
+        " `pending_restore` 并自动重试。"
+    ),
+)
+async def restore_autovacuum_override(override_id: int) -> OverrideActionResponse:
+    pool = await db.open_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            sql.SQL(
+                "UPDATE {sch}.{tbl} SET expires_at = now() "
+                "WHERE id = %s AND status IN ('active','pending_restore') "
+                "RETURNING id"
+            ).format(
+                sch=sql.Identifier(settings.job_schema),
+                tbl=sql.Identifier(settings.override_table),
+            ),
+            (override_id,),
+        )
+        found = await cur.fetchone()
+    if found is None:
+        raise HTTPException(
+            409,
+            "记录不存在，或已处于 restored/preserved 终态，无需再次恢复",
+        )
+    row = await overrides.restore_due_override(override_id)
+    if row is None:
+        raise HTTPException(409, "记录状态已变化，本次未处理；请重新查询")
+    messages = {
+        "restored": "已恢复申请前的设定",
+        "preserved": "参数已被人工改动，保留现状（见 outcome_detail）",
+        "pending_restore": "恢复被表锁阻塞，已标记待恢复，服务会自动重试",
+    }
+    return OverrideActionResponse(
+        message=messages.get(row["status"], row["status"]),
+        override=AutovacuumOverrideResponse(**row),
+    )
+
+
+def _override_http_error(exc: overrides.OverrideError) -> HTTPException:
+    detail: dict = {"message": exc.detail}
+    detail.update(exc.extra)
+    return HTTPException(exc.status_code, detail=detail)
